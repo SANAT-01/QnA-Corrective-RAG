@@ -16,6 +16,8 @@ def main() -> None:
 
     question = " ".join(sys.argv[1:])
 
+    # Every field from GraphState (qna/graph.py) needs a starting value -
+    # LangGraph doesn't default missing keys for you.
     initial_state = {
         "question": question,
         "documents": [],
@@ -26,6 +28,8 @@ def main() -> None:
         "trace": [],
     }
 
+    # Walks the whole compiled graph (retrieve -> grade -> maybe loop ->
+    # generate) and returns the final state dict once it hits END.
     result = app.invoke(initial_state)
 
     print("\n--- Trace ---")

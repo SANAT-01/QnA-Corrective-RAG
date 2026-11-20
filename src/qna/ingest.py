@@ -23,6 +23,11 @@ CHUNK_OVERLAP = 200
 
 
 def load_documents():
+    """Load every PDF/markdown/text file in docs/ into LangChain Document objects.
+
+    Each loaded Document carries `metadata["source"]` set to its file path -
+    that's what graph.py's `generate` node uses to cite sources in answers.
+    """
     documents = []
     for path in sorted(DOCS_DIR.iterdir()):
         if path.suffix.lower() == ".pdf":
@@ -40,15 +45,28 @@ def main() -> None:
     documents = load_documents()
     print(f"Loaded {len(documents)} document(s) from {DOCS_DIR}/")
 
+    # Splits each loaded document into ~CHUNK_SIZE-character pieces, with
+    # CHUNK_OVERLAP characters of overlap between consecutive chunks so a
+    # fact that straddles a chunk boundary still appears intact in at
+    # least one chunk. These are the units that actually get embedded and
+    # retrieved - not whole files.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
     )
     chunks = splitter.split_documents(documents)
     print(f"Split into {len(chunks)} chunk(s)")
 
+    # v0.1: full rebuild every run - simplest possible approach while we're
+    # focused on learning the graph itself. This nukes any previously
+    # ingested data unconditionally; v0.2 replaces this with a manifest
+    # that only re-embeds new/changed files.
     if CHROMA_DIR.exists():
         shutil.rmtree(CHROMA_DIR)
 
+    # This single call does three things: embeds every chunk's text via
+    # get_embeddings() (one call to our self-hosted API per batch), creates
+    # a fresh Chroma collection, and writes the chunks + their vectors +
+    # metadata into CHROMA_DIR on disk.
     Chroma.from_documents(
         documents=chunks,
         embedding=get_embeddings(),
