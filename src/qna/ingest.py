@@ -185,8 +185,22 @@ def ingest(rebuild: bool = False) -> None:
 
         chunks = _load_and_split_file(path, relative_path)
         chunk_ids = [str(uuid.uuid4()) for _ in chunks]
-        if chunks:
-            vector_store.add_documents(documents=chunks, ids=chunk_ids)
+        # Embed in batches rather than one call for the whole file - a
+        # large PDF can produce far more chunks than a single embeddings
+        # request should carry. embed_concurrency stays at 1 (sequential)
+        # for now; it's config'd for later, not acted on yet.
+        batch_size = settings.embed_batch_size
+        for start in range(0, len(chunks), batch_size):
+            batch_docs = chunks[start : start + batch_size]
+            batch_ids = chunk_ids[start : start + batch_size]
+            vector_store.add_documents(documents=batch_docs, ids=batch_ids)
+            logger.info(
+                "  embedded batch %d-%d of %d chunk(s) for %s",
+                start + 1,
+                start + len(batch_docs),
+                len(chunks),
+                relative_path,
+            )
 
         # Only now, after the chunks are confirmed written, record this
         # file as done - so a crash before this line just means the file

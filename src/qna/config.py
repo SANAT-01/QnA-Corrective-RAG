@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     manifest_dir: str = "chroma_db"
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    # How many chunks go into one embeddings API call, and how many such
+    # batches run concurrently. Concurrency is 1 for now (sequential) - the
+    # setting exists so throttling can be tuned later without more code
+    # changes, not because we run batches in parallel today.
+    embed_batch_size: int = 32
+    embed_concurrency: int = 1
 
     # --- Graph behavior ---
     max_retries: int = 2

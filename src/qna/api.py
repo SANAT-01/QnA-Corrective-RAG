@@ -11,6 +11,7 @@ from pydantic import BaseModel, field_validator
 
 from qna import logging_config  # noqa: F401 - configures logging on import
 from qna.graph import app as graph_app
+from qna.graph import source_label
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class AskResponse(BaseModel):
     sources: list[str]
     confident: bool
     retries: int
+    trace: list[str]
 
 
 @app.get("/health")
@@ -79,13 +81,7 @@ def ask(request: AskRequest) -> AskResponse:
 
     sources = []
     for doc in result["documents"]:
-        source = doc.metadata.get("source", "unknown")
-        if "page" in doc.metadata:
-            label = f"{source} p.{doc.metadata['page']}"
-        elif "heading" in doc.metadata:
-            label = f"{source} #{doc.metadata['heading']}"
-        else:
-            label = source
+        label = source_label(doc)
         if label not in sources:
             sources.append(label)
 
@@ -94,4 +90,5 @@ def ask(request: AskRequest) -> AskResponse:
         sources=sources,
         confident=result["confident"],
         retries=result["retry_count"],
+        trace=result["trace"],
     )

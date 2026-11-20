@@ -27,6 +27,7 @@ The graph itself:
                            generate (low_confidence=True) -> END
 """
 
+import json
 import logging
 from typing import TypedDict
 
@@ -35,10 +36,24 @@ from langgraph.graph import END, StateGraph
 
 from qna import logging_config  # noqa: F401 - configures logging on import
 from qna.config import settings
-from qna.exceptions import GenerationError
+from qna.exceptions import GenerationError, LLMError
 from qna.llm import get_chat_model, get_vector_store
 
 logger = logging.getLogger(__name__)
+
+
+def source_label(doc: Document) -> str:
+    """Human-readable citation for a chunk: filename plus page (PDF) or
+    heading (markdown) when available. Shared by grade_documents' trace
+    output and api.py's `sources` field, so both describe chunks the same
+    way.
+    """
+    source = doc.metadata.get("source", "unknown")
+    if "page" in doc.metadata:
+        return f"{source} p.{doc.metadata['page']}"
+    if "heading" in doc.metadata:
+        return f"{source} #{doc.metadata['heading']}"
+    return source
 
 
 # This is the "State" piece of LangGraph. TypedDict is just a type hint for
@@ -81,32 +96,106 @@ def retrieve(state: GraphState) -> dict:
 
 
 def grade_documents(state: GraphState) -> dict:
-    """Ask the LLM whether the retrieved chunks are actually relevant to the question.
+    """Ask the LLM to grade each retrieved chunk individually for relevance.
 
     This is the "corrective" part of Corrective RAG: instead of blindly
     generating an answer from whatever got retrieved, we have the LLM judge
-    the retrieval quality first. The verdict (`relevant`) is what the
+    each chunk's relevance first, with its reasoning. Chunks graded
+    irrelevant are dropped before generate() ever sees them; the overall
+    `relevant` flag (true if at least one chunk survived) is what the
     conditional edge (`decide_next`, below) uses to pick the next node.
     """
-    context = "\n\n---\n\n".join(doc.page_content for doc in state["documents"])
+    documents = state["documents"]
+    numbered_chunks = "\n\n---\n\n".join(
+        f"[{i}] ({source_label(doc)})\n{doc.page_content}" for i, doc in enumerate(documents)
+    )
     prompt = (
-        "You are grading whether retrieved context is relevant to a question.\n"
+        "You are grading whether each retrieved chunk below is relevant to a question.\n"
         f"Question: {state['question']}\n\n"
-        f"Retrieved context:\n{context}\n\n"
-        "Does this context contain information relevant to answering the question? "
-        "Answer with exactly one word: 'yes' or 'no'."
+        f"Chunks:\n{numbered_chunks}\n\n"
+        "Respond with ONLY a JSON array, one object per chunk, in exactly this form "
+        '(no other text before or after it):\n'
+        '[{"index": 0, "relevant": true, "reasoning": "one short sentence"}, ...]'
     )
     try:
         response = get_chat_model().invoke(prompt)
+    except LLMError:
+        raise
     except Exception as e:
         raise GenerationError(f"grade_documents: chat model call failed: {e}") from e
-    verdict = response.content.strip().lower()
-    relevant = verdict.startswith("yes")
-    logger.info("grade_documents: relevant=%s", relevant)
+
+    verdicts = _parse_grading_response(response.content, len(documents))
+    if verdicts is None:
+        # Fail open: trust the retrieval rather than block the whole answer
+        # on a parsing hiccup in the grader's structured output.
+        logger.warning("grade_documents: could not parse grading output, keeping all chunks")
+        return {
+            "documents": documents,
+            "relevant": True,
+            "trace": state["trace"] + ["grade_documents: parse failed, keeping all chunks (fail-open)"],
+        }
+
+    relevant_docs = []
+    trace_lines = []
+    for verdict in verdicts:
+        index = verdict["index"]
+        doc = documents[index]
+        trace_lines.append(
+            f"grade_documents: chunk {index} ({source_label(doc)}) "
+            f"relevant={verdict['relevant']}: \"{verdict['reasoning']}\""
+        )
+        if verdict["relevant"]:
+            relevant_docs.append(doc)
+
+    relevant = len(relevant_docs) > 0
+    logger.info("grade_documents: kept %d/%d chunk(s), relevant=%s", len(relevant_docs), len(documents), relevant)
     return {
+        # If nothing survived grading, keep the original chunks around so a
+        # low-confidence generate() still has *something* to work with,
+        # rather than an empty context.
+        "documents": relevant_docs if relevant else documents,
         "relevant": relevant,
-        "trace": state["trace"] + [f"grade_documents: relevant={relevant}"],
+        "trace": state["trace"] + trace_lines,
     }
+
+
+def _parse_grading_response(raw: str, expected_count: int) -> list[dict] | None:
+    """Parse grade_documents' expected JSON array response. Returns None
+    (triggering the fail-open path above) if the response isn't usable -
+    not just invalid JSON, but also a shape that doesn't match what we
+    retrieved, which is just as unusable.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1:
+            return None
+        text = text[start : end + 1]
+
+    try:
+        verdicts = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(verdicts, list):
+        return None
+
+    parsed = []
+    for item in verdicts:
+        if not isinstance(item, dict):
+            return None
+        index = item.get("index")
+        if not isinstance(index, int) or not (0 <= index < expected_count):
+            return None
+        parsed.append(
+            {
+                "index": index,
+                "relevant": bool(item.get("relevant")),
+                "reasoning": str(item.get("reasoning", "")).strip(),
+            }
+        )
+    return parsed
 
 
 def rewrite_query(state: GraphState) -> dict:
@@ -124,6 +213,8 @@ def rewrite_query(state: GraphState) -> dict:
     )
     try:
         response = get_chat_model().invoke(prompt)
+    except LLMError:
+        raise
     except Exception as e:
         raise GenerationError(f"rewrite_query: chat model call failed: {e}") from e
     rewritten = response.content.strip()
@@ -156,6 +247,8 @@ def generate(state: GraphState) -> dict:
     )
     try:
         response = get_chat_model().invoke(prompt)
+    except LLMError:
+        raise
     except Exception as e:
         raise GenerationError(f"generate: chat model call failed: {e}") from e
     answer = response.content.strip()
