@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Vector store (embedded Chroma, v0.1-v0.3)
+chroma_db/
+
+# Sample docs (keep folder, ignore your real content)
+docs/*
+!docs/.gitkeep
+
