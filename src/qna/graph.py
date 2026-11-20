@@ -30,14 +30,13 @@ The graph itself:
 import logging
 from typing import TypedDict
 
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
 
 from qna import logging_config  # noqa: F401 - configures logging on import
 from qna.config import settings
 from qna.exceptions import GenerationError
-from qna.llm import get_chat_model, get_embeddings
+from qna.llm import get_chat_model, get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -57,19 +56,6 @@ class GraphState(TypedDict):
     trace: list[str]        # human-readable log of which nodes ran, for debugging
 
 
-def _get_vector_store() -> Chroma:
-    """Open a handle to the (already-ingested) local Chroma store.
-
-    This doesn't create new data - ingest.py is what writes to the store.
-    This just opens the same folder for reading via similarity search.
-    """
-    return Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=get_embeddings(),
-        persist_directory=settings.chroma_dir,
-    )
-
-
 # --- Nodes ---------------------------------------------------------------
 # Each node below is a plain function: (state) -> dict of updates.
 # LangGraph calls these one at a time as it walks the graph, feeding the
@@ -83,7 +69,7 @@ def retrieve(state: GraphState) -> dict:
     has changed `state["question"]`, which is exactly how the retry loop
     gets a second (and third) chance at finding relevant context.
     """
-    vector_store = _get_vector_store()
+    vector_store = get_vector_store()
     documents = vector_store.similarity_search(state["question"], k=settings.top_k)
     logger.info("retrieve: found %d chunk(s)", len(documents))
     return {

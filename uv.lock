@@ -2490,6 +2490,7 @@ name = "qna"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "chromadb" },
     { name = "fastapi" },
     { name = "langchain" },
     { name = "langchain-chroma" },
@@ -2503,6 +2504,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "chromadb", specifier = ">=1.5.9" },
     { name = "fastapi", specifier = ">=0.165.0" },
     { name = "langchain", specifier = ">=1.5.2" },
     { name = "langchain-chroma", specifier = ">=1.1.0" },

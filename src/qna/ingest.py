@@ -1,8 +1,10 @@
-"""Load documents from docs/, split, embed, and persist to a local Chroma store.
+"""Load documents from docs/, split, embed, and write them to a standalone
+Chroma server (reached over HTTP via qna.llm.get_vector_store()).
 
-v0.2: incremental, idempotent ingestion. A manifest file
-(chroma_db/manifest.json) tracks, per file (keyed by its path relative to
-docs/), the content hash and the Chroma chunk ids it produced. Each run:
+v0.2: incremental, idempotent ingestion. A local manifest file
+(settings.manifest_dir/manifest.json) tracks, per file (keyed by its path
+relative to docs/), the content hash and the Chroma chunk ids it produced.
+Each run:
 
   - unchanged files (hash still matches the manifest) are skipped entirely
   - new files are split, embedded, and added
@@ -23,11 +25,9 @@ import argparse
 import hashlib
 import json
 import logging
-import shutil
 import uuid
 from pathlib import Path
 
-from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import (
@@ -38,7 +38,7 @@ from langchain_text_splitters import (
 from qna import logging_config  # noqa: F401 - configures logging on import
 from qna.config import settings
 from qna.exceptions import IngestionError
-from qna.llm import get_embeddings
+from qna.llm import get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +49,12 @@ def _docs_dir() -> Path:
     return Path(settings.docs_dir)
 
 
-def _chroma_dir() -> Path:
-    return Path(settings.chroma_dir)
+def _manifest_dir() -> Path:
+    return Path(settings.manifest_dir)
 
 
 def _manifest_path() -> Path:
-    return _chroma_dir() / "manifest.json"
+    return _manifest_dir() / "manifest.json"
 
 
 def _hash_file(path: Path) -> str:
@@ -69,7 +69,7 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(manifest: dict) -> None:
-    _chroma_dir().mkdir(parents=True, exist_ok=True)
+    _manifest_dir().mkdir(parents=True, exist_ok=True)
     _manifest_path().write_text(json.dumps(manifest, indent=2))
 
 
@@ -127,10 +127,6 @@ def _load_and_split_file(path: Path, relative_path: str) -> list[Document]:
 
 def ingest(rebuild: bool = False) -> None:
     docs_dir = _docs_dir()
-    chroma_dir = _chroma_dir()
-
-    if rebuild and chroma_dir.exists():
-        shutil.rmtree(chroma_dir)
 
     if not docs_dir.exists():
         raise IngestionError(f"{docs_dir}/ does not exist.")
@@ -138,12 +134,18 @@ def ingest(rebuild: bool = False) -> None:
         logger.info("No documents found in %s/. Add some PDFs or markdown files first.", docs_dir)
         return
 
+    vector_store = get_vector_store()
+
+    if rebuild:
+        # Wipe the remote collection and the local manifest, then fall
+        # through to the normal ingest loop below, which will treat every
+        # file in docs/ as new.
+        vector_store.delete_collection()
+        vector_store = get_vector_store()
+        if _manifest_path().exists():
+            _manifest_path().unlink()
+
     manifest = _load_manifest()
-    vector_store = Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=get_embeddings(),
-        persist_directory=str(chroma_dir),
-    )
 
     current_paths = {
         str(path.relative_to(docs_dir))

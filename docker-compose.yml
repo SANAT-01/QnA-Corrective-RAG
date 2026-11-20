@@ -1,0 +1,58 @@
+services:
+  chroma:
+    image: chromadb/chroma:latest
+    volumes:
+      - chroma_data:/chroma/chroma
+    # Not published to the host - only api/ingest talk to it, over the
+    # internal compose network at chroma:8000.
+    healthcheck:
+      # The official image has neither curl, wget, nor python3 - just
+      # bash + coreutils - so this uses bash's /dev/tcp built-in to make
+      # a raw HTTP request with no external tool dependency. Must invoke
+      # bash explicitly: CMD-SHELL runs via /bin/sh (dash), which doesn't
+      # support /dev/tcp.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/localhost/8000;
+          printf "GET /api/v2/heartbeat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          head -1 <&3 | grep -q 200
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./docs:/app/docs:ro
+    depends_on:
+      chroma:
+        condition: service_healthy
+
+  ingest:
+    build: .
+    command: ["uv", "run", "python", "-m", "qna.ingest"]
+    env_file: .env
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      MANIFEST_DIR: /data
+    volumes:
+      - ./docs:/app/docs:ro
+      - qna_data:/data
+    depends_on:
+      chroma:
+        condition: service_healthy
+
+volumes:
+  chroma_data:
+  qna_data:
