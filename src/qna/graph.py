@@ -237,6 +237,22 @@ def build_graph():
     return graph.compile()
 
 
+def _save_graph_diagram(compiled_graph, path: str = "graph.png") -> None:
+    """Render the compiled graph's structure to a PNG via LangGraph's
+    built-in Mermaid renderer, so the diagram can never drift from the
+    actual node/edge wiring above. Calls out to a free hosted Mermaid
+    rendering service, so this is best-effort: no network (or any other
+    failure) should ever block the app from starting.
+    """
+    try:
+        png_bytes = compiled_graph.get_graph().draw_mermaid_png()
+        with open(path, "wb") as f:
+            f.write(png_bytes)
+    except Exception as e:  # noqa: BLE001 - best-effort, never fatal
+        print(f"(skipping graph diagram: {e})")
+
+
 # Built once at import time so both main.py and (later) api.py can share
 # the same compiled graph instance.
 app = build_graph()
+_save_graph_diagram(app)
