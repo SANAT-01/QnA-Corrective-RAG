@@ -27,25 +27,19 @@ The graph itself:
                            generate (low_confidence=True) -> END
 """
 
+import logging
 from typing import TypedDict
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langgraph.graph import END, StateGraph
 
+from qna import logging_config  # noqa: F401 - configures logging on import
+from qna.config import settings
+from qna.exceptions import GenerationError
 from qna.llm import get_chat_model, get_embeddings
 
-# How many times we're willing to rewrite the question and re-retrieve before
-# giving up and answering anyway with a low-confidence flag.
-MAX_RETRIES = 2
-
-# How many chunks to pull back per retrieval pass.
-TOP_K = 4
-
-# Where the embedded (file-based) Chroma store lives. v0.1 only - from v0.4
-# onward this is replaced by a real Chroma server reached over HTTP.
-CHROMA_DIR = "chroma_db"
-COLLECTION_NAME = "qna_docs"
+logger = logging.getLogger(__name__)
 
 
 # This is the "State" piece of LangGraph. TypedDict is just a type hint for
@@ -66,13 +60,13 @@ class GraphState(TypedDict):
 def _get_vector_store() -> Chroma:
     """Open a handle to the (already-ingested) local Chroma store.
 
-    This doesn't create new data - ingest.py is what writes to CHROMA_DIR.
+    This doesn't create new data - ingest.py is what writes to the store.
     This just opens the same folder for reading via similarity search.
     """
     return Chroma(
-        collection_name=COLLECTION_NAME,
+        collection_name=settings.collection_name,
         embedding_function=get_embeddings(),
-        persist_directory=CHROMA_DIR,
+        persist_directory=settings.chroma_dir,
     )
 
 
@@ -90,7 +84,8 @@ def retrieve(state: GraphState) -> dict:
     gets a second (and third) chance at finding relevant context.
     """
     vector_store = _get_vector_store()
-    documents = vector_store.similarity_search(state["question"], k=TOP_K)
+    documents = vector_store.similarity_search(state["question"], k=settings.top_k)
+    logger.info("retrieve: found %d chunk(s)", len(documents))
     return {
         "documents": documents,
         # Note: we append to state["trace"], not mutate it, since this
@@ -115,9 +110,13 @@ def grade_documents(state: GraphState) -> dict:
         "Does this context contain information relevant to answering the question? "
         "Answer with exactly one word: 'yes' or 'no'."
     )
-    response = get_chat_model().invoke(prompt)
+    try:
+        response = get_chat_model().invoke(prompt)
+    except Exception as e:
+        raise GenerationError(f"grade_documents: chat model call failed: {e}") from e
     verdict = response.content.strip().lower()
     relevant = verdict.startswith("yes")
+    logger.info("grade_documents: relevant=%s", relevant)
     return {
         "relevant": relevant,
         "trace": state["trace"] + [f"grade_documents: relevant={relevant}"],
@@ -137,8 +136,12 @@ def rewrite_query(state: GraphState) -> dict:
         "Return only the rewritten question, nothing else.\n\n"
         f"Original question: {state['question']}"
     )
-    response = get_chat_model().invoke(prompt)
+    try:
+        response = get_chat_model().invoke(prompt)
+    except Exception as e:
+        raise GenerationError(f"rewrite_query: chat model call failed: {e}") from e
     rewritten = response.content.strip()
+    logger.info("rewrite_query: '%s'", rewritten)
     return {
         "question": rewritten,
         "retry_count": state["retry_count"] + 1,
@@ -165,13 +168,17 @@ def generate(state: GraphState) -> dict:
         f"Context:\n{context}\n\n"
         f"Question: {state['question']}"
     )
-    response = get_chat_model().invoke(prompt)
+    try:
+        response = get_chat_model().invoke(prompt)
+    except Exception as e:
+        raise GenerationError(f"generate: chat model call failed: {e}") from e
     answer = response.content.strip()
     if not confident:
         answer = (
             "[Low confidence - retrieved context may not be fully relevant]\n\n"
             + answer
         )
+    logger.info("generate: answer produced (confident=%s)", confident)
     return {
         "generation": answer,
         "confident": confident,
@@ -189,7 +196,7 @@ def decide_next(state: GraphState) -> str:
     if state["relevant"]:
         # Good context - skip straight to answering.
         return "generate"
-    if state["retry_count"] < MAX_RETRIES:
+    if state["retry_count"] < settings.max_retries:
         # Bad context, but we still have retries - rephrase and try again.
         return "rewrite_query"
     # Bad context and out of retries - answer anyway, but generate() will

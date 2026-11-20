@@ -22,6 +22,7 @@ was actually written last time, and otherwise cleans up any partial chunks).
 import argparse
 import hashlib
 import json
+import logging
 import shutil
 import uuid
 from pathlib import Path
@@ -34,17 +35,26 @@ from langchain_text_splitters import (
     RecursiveCharacterTextSplitter,
 )
 
+from qna import logging_config  # noqa: F401 - configures logging on import
+from qna.config import settings
+from qna.exceptions import IngestionError
 from qna.llm import get_embeddings
 
-DOCS_DIR = Path("docs")
-CHROMA_DIR = Path("chroma_db")
-MANIFEST_PATH = CHROMA_DIR / "manifest.json"
-COLLECTION_NAME = "qna_docs"
-
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+logger = logging.getLogger(__name__)
 
 MARKDOWN_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3")]
+
+
+def _docs_dir() -> Path:
+    return Path(settings.docs_dir)
+
+
+def _chroma_dir() -> Path:
+    return Path(settings.chroma_dir)
+
+
+def _manifest_path() -> Path:
+    return _chroma_dir() / "manifest.json"
 
 
 def _hash_file(path: Path) -> str:
@@ -52,14 +62,15 @@ def _hash_file(path: Path) -> str:
 
 
 def _load_manifest() -> dict:
-    if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text())
+    manifest_path = _manifest_path()
+    if manifest_path.exists():
+        return json.loads(manifest_path.read_text())
     return {}
 
 
 def _save_manifest(manifest: dict) -> None:
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
+    _chroma_dir().mkdir(parents=True, exist_ok=True)
+    _manifest_path().write_text(json.dumps(manifest, indent=2))
 
 
 def _load_and_split_file(path: Path, relative_path: str) -> list[Document]:
@@ -69,66 +80,74 @@ def _load_and_split_file(path: Path, relative_path: str) -> list[Document]:
     citations starting in v0.5.
     """
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap
     )
 
-    if path.suffix.lower() == ".pdf":
-        pages = PyPDFLoader(str(path)).load()
-        chunks = splitter.split_documents(pages)
-        for chunk in chunks:
-            # PyPDFLoader's own metadata already has a 0-indexed "page";
-            # surface a human-friendly 1-indexed version too.
-            chunk.metadata["source"] = relative_path
-            chunk.metadata["page"] = chunk.metadata.get("page", 0) + 1
-        return chunks
+    try:
+        if path.suffix.lower() == ".pdf":
+            pages = PyPDFLoader(str(path)).load()
+            chunks = splitter.split_documents(pages)
+            for chunk in chunks:
+                # PyPDFLoader's own metadata already has a 0-indexed "page";
+                # surface a human-friendly 1-indexed version too.
+                chunk.metadata["source"] = relative_path
+                chunk.metadata["page"] = chunk.metadata.get("page", 0) + 1
+            return chunks
 
-    if path.suffix.lower() in (".md", ".markdown"):
-        text = path.read_text()
-        # First split on markdown headings, so each piece carries its
-        # nearest h1/h2/h3 in metadata; then re-split further by size,
-        # since a section between headings can still be too long.
-        header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=MARKDOWN_HEADERS, strip_headers=False
-        )
-        sections = header_splitter.split_text(text)
-        chunks = splitter.split_documents(sections)
-        for chunk in chunks:
-            chunk.metadata["source"] = relative_path
-            heading = (
-                chunk.metadata.get("h3")
-                or chunk.metadata.get("h2")
-                or chunk.metadata.get("h1")
+        if path.suffix.lower() in (".md", ".markdown"):
+            text = path.read_text()
+            # First split on markdown headings, so each piece carries its
+            # nearest h1/h2/h3 in metadata; then re-split further by size,
+            # since a section between headings can still be too long.
+            header_splitter = MarkdownHeaderTextSplitter(
+                headers_to_split_on=MARKDOWN_HEADERS, strip_headers=False
             )
-            if heading:
-                chunk.metadata["heading"] = heading
-        return chunks
+            sections = header_splitter.split_text(text)
+            chunks = splitter.split_documents(sections)
+            for chunk in chunks:
+                chunk.metadata["source"] = relative_path
+                heading = (
+                    chunk.metadata.get("h3")
+                    or chunk.metadata.get("h2")
+                    or chunk.metadata.get("h1")
+                )
+                if heading:
+                    chunk.metadata["heading"] = heading
+            return chunks
 
-    # Plain text fallback.
-    docs = TextLoader(str(path)).load()
-    chunks = splitter.split_documents(docs)
-    for chunk in chunks:
-        chunk.metadata["source"] = relative_path
-    return chunks
+        # Plain text fallback.
+        docs = TextLoader(str(path)).load()
+        chunks = splitter.split_documents(docs)
+        for chunk in chunks:
+            chunk.metadata["source"] = relative_path
+        return chunks
+    except Exception as e:
+        raise IngestionError(f"Failed to load/split {relative_path}: {e}") from e
 
 
 def ingest(rebuild: bool = False) -> None:
-    if rebuild and CHROMA_DIR.exists():
-        shutil.rmtree(CHROMA_DIR)
+    docs_dir = _docs_dir()
+    chroma_dir = _chroma_dir()
 
-    if not DOCS_DIR.exists() or not any(DOCS_DIR.iterdir()):
-        print(f"No documents found in {DOCS_DIR}/. Add some PDFs or markdown files first.")
+    if rebuild and chroma_dir.exists():
+        shutil.rmtree(chroma_dir)
+
+    if not docs_dir.exists():
+        raise IngestionError(f"{docs_dir}/ does not exist.")
+    if not any(docs_dir.iterdir()):
+        logger.info("No documents found in %s/. Add some PDFs or markdown files first.", docs_dir)
         return
 
     manifest = _load_manifest()
     vector_store = Chroma(
-        collection_name=COLLECTION_NAME,
+        collection_name=settings.collection_name,
         embedding_function=get_embeddings(),
-        persist_directory=str(CHROMA_DIR),
+        persist_directory=str(chroma_dir),
     )
 
     current_paths = {
-        str(path.relative_to(DOCS_DIR))
-        for path in DOCS_DIR.rglob("*")
+        str(path.relative_to(docs_dir))
+        for path in docs_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in (".pdf", ".md", ".markdown", ".txt")
     }
 
@@ -141,16 +160,16 @@ def ingest(rebuild: bool = False) -> None:
                 vector_store.delete(ids=chunk_ids)
             del manifest[relative_path]
             _save_manifest(manifest)
-            print(f"Removed: {relative_path} ({len(chunk_ids)} chunk(s) deleted)")
+            logger.info("Removed: %s (%d chunk(s) deleted)", relative_path, len(chunk_ids))
 
     # New or changed files: (re-)embed. Unchanged files are skipped.
     for relative_path in sorted(current_paths):
-        path = DOCS_DIR / relative_path
+        path = docs_dir / relative_path
         file_hash = _hash_file(path)
         existing = manifest.get(relative_path)
 
         if existing is not None and existing["hash"] == file_hash:
-            print(f"Unchanged, skipping: {relative_path}")
+            logger.info("Unchanged, skipping: %s", relative_path)
             continue
 
         # Delete-then-insert: covers both "this file changed" (its old
@@ -173,9 +192,9 @@ def ingest(rebuild: bool = False) -> None:
         manifest[relative_path] = {"hash": file_hash, "chunk_ids": chunk_ids}
         _save_manifest(manifest)
         verb = "Embedded" if existing is None else "Re-embedded"
-        print(f"{verb}: {relative_path} ({len(chunks)} chunk(s))")
+        logger.info("%s: %s (%d chunk(s))", verb, relative_path, len(chunks))
 
-    print("Ingestion complete.")
+    logger.info("Ingestion complete.")
 
 
 def main() -> None:
